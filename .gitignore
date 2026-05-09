@@ -1,0 +1,16 @@
+# Python
+livora-backend/venv/
+livora-backend/__pycache__/
+livora-backend/**/__pycache__/
+livora-backend/*.pyc
+livora-backend/ml_models/*.pt
+livora-backend/ml_models/*.pkl
+livora-backend/.env
+
+# Node
+livora-frontend-updated/node_modules/
+livora-frontend-updated/dist/
+
+# OS
+.DS_Store
+Thumbs.db
