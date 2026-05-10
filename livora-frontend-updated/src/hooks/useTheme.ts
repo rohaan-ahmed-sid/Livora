@@ -6,7 +6,7 @@ function getStoredTheme(): "light" | "dark" {
   if (typeof window !== "undefined") {
     return (localStorage.getItem(THEME_KEY) as "light" | "dark") || "dark";
   }
-  return "light";
+  return "dark";
 }
 
 function applyTheme(t: "light" | "dark") {
