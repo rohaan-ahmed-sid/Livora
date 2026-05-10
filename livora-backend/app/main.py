@@ -19,6 +19,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+from fastapi import Request
+
+@app.middleware("http")
+async def ngrok_skip_warning(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["ngrok-skip-browser-warning"] = "true"
+    return response
+
 app.include_router(auth_router)
 app.include_router(glucose_router)
 app.include_router(meals_router)
