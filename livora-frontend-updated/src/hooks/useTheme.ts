@@ -4,7 +4,7 @@ const THEME_KEY = "livora-theme";
 
 function getStoredTheme(): "light" | "dark" {
   if (typeof window !== "undefined") {
-    return (localStorage.getItem(THEME_KEY) as "light" | "dark") || "light";
+    return (localStorage.getItem(THEME_KEY) as "light" | "dark") || "dark";
   }
   return "light";
 }
