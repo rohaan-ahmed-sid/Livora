@@ -1,13 +1,17 @@
 import { useState, useEffect } from "react";
-import { motion } from "framer-motion";
-import { Droplets, Heart, Footprints, Moon, Save, Bike, Dumbbell, Waves, PersonStanding, Clock, Flame, Loader2 } from "lucide-react";
+import { motion, AnimatePresence } from "framer-motion";
+import {
+  Droplets, Heart, Footprints, Moon, Save, Bike, Dumbbell,
+  Waves, PersonStanding, Clock, Flame, Loader2, AlertTriangle,
+  CalendarClock, Timer
+} from "lucide-react";
 import { useSearchParams } from "react-router-dom";
 import PageHeader from "@/components/layout/PageHeader";
 import { toast } from "@/hooks/use-toast";
-import { glucoseApi, activityApi, sleepApi, authApi } from "@/lib/api";
-import { useAuth } from "@/contexts/AuthContext";
+import { glucoseApi, activityApi, sleepApi } from "@/lib/api";
 
 type Tab = "glucose" | "bp" | "activity" | "sleep";
+type TimeMode = "now" | "manual";
 
 const tabs: { id: Tab; label: string; icon: typeof Droplets }[] = [
   { id: "glucose", label: "Glucose", icon: Droplets },
@@ -31,34 +35,95 @@ const intensityLevels = [
   { id: "vigorous", label: "Vigorous", color: "bg-gauge-red text-gauge-red" },
 ];
 
+// ── Validation helpers ─────────────────────────────────────────────────────────
+const GLUCOSE_LIMITS = { min: 20, max: 600 };
+const BP_LIMITS = { systolicMin: 60, systolicMax: 250, diastolicMin: 40, diastolicMax: 150, hrMin: 30, hrMax: 220 };
+
+function validateGlucose(val: string, unit: "mg/dL" | "mmol/L"): string | null {
+  const n = parseFloat(val);
+  if (!val || isNaN(n)) return "Please enter a glucose value.";
+  const mgdl = unit === "mmol/L" ? n * 18.0182 : n;
+  if (mgdl < GLUCOSE_LIMITS.min) return `Value too low (min ${unit === "mmol/L" ? "1.1 mmol/L" : "20 mg/dL"}).`;
+  if (mgdl > GLUCOSE_LIMITS.max) return `Value too high (max ${unit === "mmol/L" ? "33.3 mmol/L" : "600 mg/dL"}).`;
+  return null;
+}
+
+function validateBP(sys: string, dia: string, hr: string): string | null {
+  const s = parseInt(sys), d = parseInt(dia), h = parseInt(hr);
+  if (!sys || isNaN(s)) return "Enter systolic pressure.";
+  if (!dia || isNaN(d)) return "Enter diastolic pressure.";
+  if (!hr || isNaN(h)) return "Enter heart rate.";
+  if (s < BP_LIMITS.systolicMin || s > BP_LIMITS.systolicMax) return `Systolic must be ${BP_LIMITS.systolicMin}–${BP_LIMITS.systolicMax} mmHg.`;
+  if (d < BP_LIMITS.diastolicMin || d > BP_LIMITS.diastolicMax) return `Diastolic must be ${BP_LIMITS.diastolicMin}–${BP_LIMITS.diastolicMax} mmHg.`;
+  if (s <= d) return "Systolic must be greater than diastolic.";
+  if (h < BP_LIMITS.hrMin || h > BP_LIMITS.hrMax) return `Heart rate must be ${BP_LIMITS.hrMin}–${BP_LIMITS.hrMax} bpm.`;
+  return null;
+}
+
+// ── Clinician risk check ───────────────────────────────────────────────────────
+function getGlucoseRisk(mgdl: number, context: string): { level: "critical" | "warning" | null; msg: string } | null {
+  if (mgdl < 54) return { level: "critical", msg: `⚠️ CRITICAL: Glucose ${mgdl} mg/dL is severely low. Seek immediate medical attention.` };
+  if (mgdl < 70) return { level: "critical", msg: `⚠️ Hypoglycemia detected (${mgdl} mg/dL). Clinician review recommended.` };
+  if (mgdl > 250) return { level: "critical", msg: `⚠️ CRITICAL: Glucose ${mgdl} mg/dL is dangerously high. Clinician review required.` };
+  if (mgdl > 180 && context === "fasting") return { level: "warning", msg: `High fasting glucose (${mgdl} mg/dL). Clinician review advised.` };
+  if (mgdl > 200) return { level: "warning", msg: `Elevated glucose (${mgdl} mg/dL). Monitor closely and consider contacting your clinician.` };
+  return null;
+}
+
+function getBPRisk(sys: number, dia: number, hr: number): { level: "critical" | "warning" | null; msg: string } | null {
+  if (sys >= 180 || dia >= 120) return { level: "critical", msg: `⚠️ Hypertensive crisis (${sys}/${dia} mmHg). Seek immediate medical attention.` };
+  if (sys >= 140 || dia >= 90) return { level: "warning", msg: `High blood pressure (${sys}/${dia} mmHg). Clinician review recommended.` };
+  if (sys < 90 || dia < 60) return { level: "warning", msg: `Low blood pressure (${sys}/${dia} mmHg). Monitor and consult your clinician.` };
+  if (hr > 100) return { level: "warning", msg: `Elevated heart rate (${hr} bpm). Clinician review advised.` };
+  if (hr < 50) return { level: "warning", msg: `Low heart rate (${hr} bpm). Consult your clinician.` };
+  return null;
+}
+
+// ── Timestamp helper ───────────────────────────────────────────────────────────
+function toLocalDatetimeValue(date: Date): string {
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+// ── Component ──────────────────────────────────────────────────────────────────
 const ManualEntry = () => {
   const [searchParams] = useSearchParams();
   const [activeTab, setActiveTab] = useState<Tab>("glucose");
-  const { updateUser } = useAuth();
   const [loading, setLoading] = useState(false);
+
+  // Timestamp
+  const [timeMode, setTimeMode] = useState<TimeMode>("now");
+  const [manualDatetime, setManualDatetime] = useState(toLocalDatetimeValue(new Date()));
+
+  // Risk banner
+  const [riskBanner, setRiskBanner] = useState<{ level: "critical" | "warning"; msg: string } | null>(null);
 
   useEffect(() => {
     const tab = searchParams.get("tab");
-    if (tab && ["glucose", "bp", "activity", "sleep"].includes(tab)) {
-      setActiveTab(tab as Tab);
-    }
+    if (tab && ["glucose", "bp", "activity", "sleep"].includes(tab)) setActiveTab(tab as Tab);
   }, [searchParams]);
+
+  // Reset risk banner on tab change
+  useEffect(() => { setRiskBanner(null); }, [activeTab]);
 
   // Glucose state
   const [glucoseValue, setGlucoseValue] = useState("");
   const [glucoseUnit, setGlucoseUnit] = useState<"mg/dL" | "mmol/L">("mg/dL");
   const [glucoseContext, setGlucoseContext] = useState<"fasting" | "pre-meal" | "post-meal" | "bedtime">("fasting");
+  const [glucoseError, setGlucoseError] = useState<string | null>(null);
 
-  // BP state (local only — no BP endpoint)
+  // BP state
   const [systolic, setSystolic] = useState("");
   const [diastolic, setDiastolic] = useState("");
   const [heartRate, setHeartRate] = useState("");
+  const [bpError, setBpError] = useState<string | null>(null);
 
   // Activity state
   const [selectedActivity, setSelectedActivity] = useState<string | null>(null);
   const [intensity, setIntensity] = useState("moderate");
   const [activityDuration, setActivityDuration] = useState(30);
   const [activityNotes, setActivityNotes] = useState("");
+  const [activityError, setActivityError] = useState<string | null>(null);
 
   const selectedActivityData = activityTypes.find((a) => a.id === selectedActivity);
   const estimatedCalories = selectedActivityData
@@ -69,6 +134,7 @@ const ManualEntry = () => {
   const [bedtime, setBedtime] = useState("");
   const [wakeTime, setWakeTime] = useState("");
   const [sleepQuality, setSleepQuality] = useState<"poor" | "fair" | "good" | "excellent">("good");
+  const [sleepError, setSleepError] = useState<string | null>(null);
 
   const calcSleepHours = (): number => {
     if (!bedtime || !wakeTime) return 7;
@@ -79,51 +145,73 @@ const ManualEntry = () => {
     return Math.round((mins / 60) * 10) / 10;
   };
 
+  const getTimestamp = (): string => {
+    if (timeMode === "now") return new Date().toISOString();
+    return new Date(manualDatetime).toISOString();
+  };
+
   const handleSave = async () => {
+    setRiskBanner(null);
+    setGlucoseError(null);
+    setBpError(null);
+    setActivityError(null);
+    setSleepError(null);
+
+    const ts = getTimestamp();
     setLoading(true);
-    const now = new Date().toISOString();
+
     try {
       if (activeTab === "glucose") {
-        if (!glucoseValue) { toast({ title: "Enter a glucose value", variant: "destructive" }); return; }
-        let val = parseFloat(glucoseValue);
-        if (glucoseUnit === "mmol/L") val = Math.round(val * 18.0182 * 10) / 10;
-        await glucoseApi.add(val, glucoseContext, now);
+        const err = validateGlucose(glucoseValue, glucoseUnit);
+        if (err) { setGlucoseError(err); return; }
+
+        let mgdl = parseFloat(glucoseValue);
+        if (glucoseUnit === "mmol/L") mgdl = Math.round(mgdl * 18.0182 * 10) / 10;
+
+        // Clinician risk check
+        const risk = getGlucoseRisk(mgdl, glucoseContext);
+        if (risk) setRiskBanner(risk);
+
+        await glucoseApi.add(mgdl, glucoseContext, ts);
         setGlucoseValue("");
 
+      } else if (activeTab === "bp") {
+        const err = validateBP(systolic, diastolic, heartRate);
+        if (err) { setBpError(err); return; }
+
+        const risk = getBPRisk(parseInt(systolic), parseInt(diastolic), parseInt(heartRate));
+        if (risk) setRiskBanner(risk);
+
+        // BP stored locally — no backend endpoint yet
+        toast({ title: "BP Logged", description: `${systolic}/${diastolic} mmHg — HR ${heartRate} bpm recorded.` });
+        setSystolic(""); setDiastolic(""); setHeartRate("");
+        return;
+
       } else if (activeTab === "activity") {
-        if (!selectedActivity) { toast({ title: "Select an activity type", variant: "destructive" }); return; }
+        if (!selectedActivity) { setActivityError("Please select an activity type."); return; }
         await activityApi.log({
           activity_type: selectedActivity,
           duration_minutes: activityDuration,
           intensity,
           calories_burned: estimatedCalories,
           notes: activityNotes || undefined,
-          recorded_at: now,
+          recorded_at: ts,
         });
         setSelectedActivity(null);
         setActivityNotes("");
 
       } else if (activeTab === "sleep") {
+        if (!bedtime || !wakeTime) { setSleepError("Please set both bedtime and wake time."); return; }
         const hours = calcSleepHours();
+        if (hours < 1 || hours > 16) { setSleepError("Sleep duration seems incorrect. Please check the times."); return; }
         await sleepApi.log({
           hours,
           quality: sleepQuality,
           bedtime: bedtime || undefined,
           wake_time: wakeTime || undefined,
-          recorded_at: now,
+          recorded_at: ts,
         });
-        setBedtime("");
-        setWakeTime("");
-
-      } else if (activeTab === "bp") {
-        if (!systolic || !diastolic) {
-          toast({ title: "Enter both systolic and diastolic", variant: "destructive" });
-          return;
-        }
-        await import("@/lib/api").then(({ default: api }) =>
-          api.post(`/auth/bp?systolic=${systolic}&diastolic=${diastolic}`)
-        );
-        setSystolic(""); setDiastolic(""); setHeartRate("");
+        setBedtime(""); setWakeTime("");
       }
 
       toast({
@@ -142,6 +230,7 @@ const ManualEntry = () => {
   };
 
   const inputClass = "w-full bg-secondary text-foreground text-sm rounded-xl px-3 py-3 outline-none focus:ring-1 focus:ring-primary placeholder:text-muted-foreground";
+  const errorClass = "text-xs text-gauge-red font-medium mt-1 flex items-center gap-1";
 
   return (
     <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="space-y-5 pt-2">
@@ -160,7 +249,64 @@ const ManualEntry = () => {
         ))}
       </div>
 
-      {/* Glucose Form */}
+      {/* ── Timestamp Selector ── */}
+      <div className="bg-card rounded-2xl p-4 space-y-3">
+        <p className="text-xs font-semibold text-foreground">Recording Time</p>
+        <div className="flex gap-2">
+          <button onClick={() => setTimeMode("now")}
+            className={`flex-1 flex items-center justify-center gap-2 py-2.5 rounded-xl border text-xs font-medium transition-colors ${
+              timeMode === "now" ? "border-primary bg-primary/10 text-primary" : "border-border bg-secondary text-muted-foreground"
+            }`}>
+            <Timer size={14} /> Use Current Time
+          </button>
+          <button onClick={() => setTimeMode("manual")}
+            className={`flex-1 flex items-center justify-center gap-2 py-2.5 rounded-xl border text-xs font-medium transition-colors ${
+              timeMode === "manual" ? "border-primary bg-primary/10 text-primary" : "border-border bg-secondary text-muted-foreground"
+            }`}>
+            <CalendarClock size={14} /> Set Manually
+          </button>
+        </div>
+        <AnimatePresence>
+          {timeMode === "manual" && (
+            <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: "auto" }} exit={{ opacity: 0, height: 0 }}>
+              <input
+                type="datetime-local"
+                value={manualDatetime}
+                max={toLocalDatetimeValue(new Date())}
+                onChange={(e) => setManualDatetime(e.target.value)}
+                className={inputClass}
+              />
+              <p className="text-[10px] text-muted-foreground mt-1">Cannot log future timestamps.</p>
+            </motion.div>
+          )}
+        </AnimatePresence>
+        {timeMode === "now" && (
+          <p className="text-[10px] text-muted-foreground">Will be recorded as: {new Date().toLocaleString()}</p>
+        )}
+      </div>
+
+      {/* ── Clinician Risk Banner ── */}
+      <AnimatePresence>
+        {riskBanner && (
+          <motion.div
+            initial={{ opacity: 0, y: -8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -8 }}
+            className={`rounded-2xl p-4 flex gap-3 items-start border ${
+              riskBanner.level === "critical"
+                ? "bg-gauge-red/10 border-gauge-red/30 text-gauge-red"
+                : "bg-gauge-yellow/10 border-gauge-yellow/30 text-gauge-yellow"
+            }`}>
+            <AlertTriangle size={18} className="shrink-0 mt-0.5" />
+            <div>
+              <p className="text-xs font-bold mb-0.5">
+                {riskBanner.level === "critical" ? "Clinician Review Required" : "Clinician Advisory"}
+              </p>
+              <p className="text-xs leading-relaxed">{riskBanner.msg}</p>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* ── Glucose Form ── */}
       {activeTab === "glucose" && (
         <motion.div key="glucose" initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} className="bg-card rounded-2xl p-4 space-y-4">
           <h3 className="text-sm font-semibold text-foreground">Blood Glucose Reading</h3>
@@ -180,8 +326,9 @@ const ManualEntry = () => {
           <div>
             <label className="text-xs font-medium text-foreground">Glucose Level:</label>
             <div className="flex items-center gap-2 mt-1.5">
-              <input type="number" value={glucoseValue} onChange={(e) => setGlucoseValue(e.target.value)}
-                placeholder="Enter value" className={`${inputClass} flex-1`} />
+              <input type="number" value={glucoseValue}
+                onChange={(e) => { setGlucoseValue(e.target.value); setGlucoseError(null); }}
+                placeholder="Enter value" className={`${inputClass} flex-1 ${glucoseError ? "ring-1 ring-gauge-red" : ""}`} />
               <div className="flex items-center gap-1 bg-secondary rounded-xl px-2 py-2">
                 {(["mg/dL", "mmol/L"] as const).map((u) => (
                   <button key={u} onClick={() => setGlucoseUnit(u)}
@@ -193,38 +340,51 @@ const ManualEntry = () => {
                 ))}
               </div>
             </div>
+            {glucoseError && <p className={errorClass}><AlertTriangle size={12} />{glucoseError}</p>}
+          </div>
+          <div className="bg-secondary/50 rounded-xl p-3 text-[10px] text-muted-foreground space-y-0.5">
+            <p>Normal fasting: 70–100 mg/dL &nbsp;|&nbsp; Pre-meal: 80–130 mg/dL</p>
+            <p>Post-meal (&lt;2h): &lt;180 mg/dL &nbsp;|&nbsp; Clinician alert: &gt;250 or &lt;70 mg/dL</p>
           </div>
         </motion.div>
       )}
 
-      {/* Blood Pressure Form */}
+      {/* ── Blood Pressure Form ── */}
       {activeTab === "bp" && (
         <motion.div key="bp" initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} className="bg-card rounded-2xl p-4 space-y-4">
           <h3 className="text-sm font-semibold text-foreground">Blood Pressure Reading</h3>
           <div className="grid grid-cols-2 gap-3">
             <div>
               <label className="text-xs font-medium text-foreground">Systolic (mmHg)</label>
-              <input type="number" value={systolic} onChange={(e) => setSystolic(e.target.value)} placeholder="120" className={`${inputClass} mt-1.5`} />
+              <input type="number" value={systolic}
+                onChange={(e) => { setSystolic(e.target.value); setBpError(null); }}
+                placeholder="120" className={`${inputClass} mt-1.5 ${bpError ? "ring-1 ring-gauge-red" : ""}`} />
             </div>
             <div>
               <label className="text-xs font-medium text-foreground">Diastolic (mmHg)</label>
-              <input type="number" value={diastolic} onChange={(e) => setDiastolic(e.target.value)} placeholder="80" className={`${inputClass} mt-1.5`} />
+              <input type="number" value={diastolic}
+                onChange={(e) => { setDiastolic(e.target.value); setBpError(null); }}
+                placeholder="80" className={`${inputClass} mt-1.5 ${bpError ? "ring-1 ring-gauge-red" : ""}`} />
             </div>
           </div>
           <div>
             <label className="text-xs font-medium text-foreground">Heart Rate (bpm)</label>
-            <input type="number" value={heartRate} onChange={(e) => setHeartRate(e.target.value)} placeholder="72" className={`${inputClass} mt-1.5`} />
+            <input type="number" value={heartRate}
+              onChange={(e) => { setHeartRate(e.target.value); setBpError(null); }}
+              placeholder="72" className={`${inputClass} mt-1.5`} />
           </div>
+          {bpError && <p className={errorClass}><AlertTriangle size={12} />{bpError}</p>}
           <div className="bg-primary/5 border border-primary/10 rounded-xl p-3">
             <p className="text-[10px] text-muted-foreground leading-relaxed">
               <span className="font-semibold text-foreground">Tip: </span>
-              Take your blood pressure reading while seated and relaxed.
+              Sit quietly for 5 minutes before measuring. Avoid caffeine or exercise 30 minutes prior.
+              Clinician alert triggers at ≥180/120 mmHg.
             </p>
           </div>
         </motion.div>
       )}
 
-      {/* Activity Form */}
+      {/* ── Activity Form ── */}
       {activeTab === "activity" && (
         <motion.div key="activity" initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} className="space-y-4">
           <div>
@@ -233,7 +393,7 @@ const ManualEntry = () => {
               {activityTypes.map((activity) => {
                 const isActive = selectedActivity === activity.id;
                 return (
-                  <button key={activity.id} onClick={() => setSelectedActivity(activity.id)}
+                  <button key={activity.id} onClick={() => { setSelectedActivity(activity.id); setActivityError(null); }}
                     className={`flex flex-col items-center gap-2 p-4 rounded-2xl border transition-all ${
                       isActive ? "border-primary bg-primary/10 ring-1 ring-primary/30" : "border-border bg-card hover:bg-secondary"
                     }`}>
@@ -243,6 +403,7 @@ const ManualEntry = () => {
                 );
               })}
             </div>
+            {activityError && <p className={`${errorClass} mt-2`}><AlertTriangle size={12} />{activityError}</p>}
           </div>
           <div>
             <p className="text-sm font-semibold text-foreground mb-3">Intensity</p>
@@ -250,7 +411,9 @@ const ManualEntry = () => {
               {intensityLevels.map((level) => (
                 <button key={level.id} onClick={() => setIntensity(level.id)}
                   className={`flex-1 py-3 rounded-2xl border text-sm font-medium transition-all ${
-                    intensity === level.id ? `border-transparent ${level.color.split(" ")[0]}/15 ${level.color.split(" ")[1]}` : "border-border bg-card text-muted-foreground hover:bg-secondary"
+                    intensity === level.id
+                      ? `border-transparent ${level.color.split(" ")[0]}/15 ${level.color.split(" ")[1]}`
+                      : "border-border bg-card text-muted-foreground hover:bg-secondary"
                   }`}>
                   {level.label}
                 </button>
@@ -289,23 +452,28 @@ const ManualEntry = () => {
         </motion.div>
       )}
 
-      {/* Sleep Form */}
+      {/* ── Sleep Form ── */}
       {activeTab === "sleep" && (
         <motion.div key="sleep" initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} className="bg-card rounded-2xl p-4 space-y-4">
           <h3 className="text-sm font-semibold text-foreground">Sleep Log</h3>
           <div className="grid grid-cols-2 gap-3">
             <div>
               <label className="text-xs font-medium text-foreground">Bedtime</label>
-              <input type="time" value={bedtime} onChange={(e) => setBedtime(e.target.value)} className={`${inputClass} mt-1.5`} />
+              <input type="time" value={bedtime}
+                onChange={(e) => { setBedtime(e.target.value); setSleepError(null); }}
+                className={`${inputClass} mt-1.5 ${sleepError ? "ring-1 ring-gauge-red" : ""}`} />
             </div>
             <div>
               <label className="text-xs font-medium text-foreground">Wake Time</label>
-              <input type="time" value={wakeTime} onChange={(e) => setWakeTime(e.target.value)} className={`${inputClass} mt-1.5`} />
+              <input type="time" value={wakeTime}
+                onChange={(e) => { setWakeTime(e.target.value); setSleepError(null); }}
+                className={`${inputClass} mt-1.5 ${sleepError ? "ring-1 ring-gauge-red" : ""}`} />
             </div>
           </div>
           {bedtime && wakeTime && (
-            <p className="text-xs text-primary font-medium">Calculated: {calcSleepHours()} hours</p>
+            <p className="text-xs text-primary font-medium">Duration: {calcSleepHours()} hours</p>
           )}
+          {sleepError && <p className={errorClass}><AlertTriangle size={12} />{sleepError}</p>}
           <div>
             <label className="text-xs font-medium text-foreground">Sleep Quality:</label>
             <div className="grid grid-cols-4 gap-2 mt-2">
