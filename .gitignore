@@ -10,6 +10,7 @@ livora-backend/.env
 # Node
 livora-frontend-updated/node_modules/
 livora-frontend-updated/dist/
+livora-frontend-updated/.env
 
 # OS
 .DS_Store
